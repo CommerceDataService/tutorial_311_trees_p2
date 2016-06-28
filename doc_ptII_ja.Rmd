@@ -1,0 +1,501 @@
+---
+title: "Who uses 311? (Part 2)"
+author: "Jonathan Auerbach and Christopher Eshleman"
+date: "June 2, 2016"
+output: html_document
+subtitle: Modeling service requests and neighborhood characteristics
+---
+
+#Identifying Groups that Ask Government for Help.
+
+Just as some people are more likely than others to vote, some residents are more inclined to ask local government for help. For example, certain residents may be more vocal about fixing potholes or reporting noisy neighbors. Over the past decade, cities across the United States have invested in nonemergency hotlines that help the public make such requests. These hotlines, built as 311 service centers, also offer a spillover benefit: they provide researchers with a deep cache of data on public behavior. Data released on 311 use is being leveraged with increasing frequency to investigate sociological questions specific to urban environments. This is what we try to do here. 
+
+This post picks up from an earlier entry, "Who Uses 311? (Part 1)", where we asked and explored some basic questions regarding New Yorkers’ use of 311. The first hundred-odd lines of this script load the same packages and executes the same functions as the first “Who Uses 311?” post. No need to glance back at the previous entry. The rest of the post burrows deeper toward an answer of which neighborhoods and social groups are more likely to use 311 than others. Identifying groups who use 311 has, as was discussed in the prior post, a variety of potential applications. It could, for example, help municipal managers understand which neighborhoods may be shy when it comes to asking for help, and could thus help them provide services in neighborhoods than might otherwise go underserved.
+
+To find out who uses 311, we take advantage of an incredible natrual experiment. We look at 311 requests specific to tree damage that gets reported immediately after major storms. We then combine that data set with data from the US Census Bureau and the City's decennial tree census. Last time we started big. We investigated reported rates over time and space. We also looked at reported rates per household and number of trees. This time we'll start small. We'll look at specific parts of New York City's diverse demographic makeup.
+
+The next batch of script repeats the necessary steps of preparing the open data from the first post and prepares us to do some modeling. For details, please refer to the previous post.
+
+```{r setup, echo=FALSE}
+setwd(paste("/Users/sigmamonstr/Github/tutorial_311_trees_p2",sep=""))
+```
+
+###Setup
+Before starting, note that all packages that are required are listed in Part 1 of this tutorial. Also, we will run all of the data processing scripts as run in Part 1.
+```{r part1a,message=FALSE,warning=FALSE}
+## This function will check if a package is installed, and if not, install it
+  pkgTest <- function(x) {
+      if (!require(x, character.only = TRUE)) {
+          print(paste("installing",x))
+          install.packages(x, dep = TRUE)
+          if (!require(x, character.only = TRUE)) 
+              stop("Package not found")
+      } else{
+        print(paste(x,"found"))
+      }
+  }
+
+## These lines load the required packages
+  packages <- c("rgeos", "rgdal", "maptools", "plyr", "reshape2", "ggplot2", "ggmap", "rstan","StanHeaders")
+
+##Apply the pkgTest using lapply()
+  lapply(packages, pkgTest)
+
+#311 Reports are divided into two datasets, each is provided in zipped form
+#We read both datasets into R separately and then combine them together
+  temp = tempfile()
+  unzip("data/311_Service_Requests_for_2009.zip",exdir=getwd())
+  reports09 <- read.csv("311_Service_Requests_for_2009.csv")
+  unlink(temp)
+
+  temp = tempfile()
+  unzip("data/311_Service_Requests_from_2010_to_Present.zip",exdir=getwd())
+  reports10plus <- read.csv("311_Service_Requests_from_2010_to_Present.csv")
+  unlink(temp)
+  reports10plus$Resolution.Description <- NULL 
+  
+#Append 09 with 10+ together
+  reports = rbind(reports09,reports10plus) 
+  rm(reports09,reports10plus)
+
+#To facilitate our analysis, we convert the report created date into a date object
+  reports$Date <- as.Date(reports$Created.Date,format="%m/%d/%Y")
+
+#Here we provide the dates for 8 major storms
+  storm.dates <- as.Date(c("2009-08-18", #BILL
+                           "2009-10-07",
+                           "2010-03-13",
+                           "2010-05-08",
+                           "2010-09-16", #TORNADO
+                           "2011-08-30", #IRENE
+                           "2011-10-29",
+                           "2012-10-29"), #SANDY
+                         format = "%Y-%m-%d")
+
+#We remove all reports not within two days of the storm. This is best done by first creating a function that tests if a report is in a storm intervals and then "applying" it across all storms.
+  reports.dates <- cbind(storm.dates,storm.dates+1)
+  interval.index <- function(dates,interval) which(dates >= interval[1] & dates <= interval[2])
+  reports <- reports[unlist(apply(reports.dates,1,interval.index,dates=reports$Date)),]
+
+#We also remove reports with no location. These happen to be infrequent.
+  reports <- reports[!is.na(reports$X.Coordinate..State.Plane.),]
+
+###Spatial data
+###Census tract shapefile
+#Read in shapefile from source
+    temp = tempfile()
+    url="http://www1.nyc.gov/assets/planning/download/zip/data-maps/open-data/nyct201016b.zip"
+    download.file(url, temp) ##download the URL taret to the temp file
+    unzip(temp,exdir=getwd()) ##unzip that file
+    tracts <- readOGR("nyct2010_16b/nyct2010.shp","nyct2010")
+    
+#We convert the shapefile to a data.frame for plotting
+    tracts@data$id <- rownames(tracts@data)
+    tracts.points <- fortify(tracts, region="id")
+    tracts.df <- join(tracts.points, tracts@data, by="id")
+
+####NYC Parks Shapefile
+  #Read in shapefile from source
+    temp = tempfile()
+    url="https://data.cityofnewyork.us/api/geospatial/rjaj-zgq7?method=export&format=Original"
+    download.file(url, temp) ##download the URL taret to the temp file
+    unzip(temp,exdir=getwd()) ##unzip that file
+    parks <- readOGR("DPR_ParksProperties_001/DPR_ParksProperties_001.shp",
+                     "DPR_ParksProperties_001")
+    
+  #We convert the shapefile to a data.frame for plotting
+    parks@data$id <- rownames(parks@data)
+    parks.points <- fortify(parks, region="id")
+    parks.df <- join(parks.points, parks@data, by="id")
+
+#We convert each report to a spatial points (sp) object.
+  reports.sp <- SpatialPoints(coord=reports[, c("X.Coordinate..State.Plane.","Y.Coordinate..State.Plane.")],
+                              proj4string=tracts@proj4string)
+    
+#We use the over function to find the tract for each report
+  reports <- cbind(reports,over(x=reports.sp,y=tracts))
+  
+#We remove points with no assinged Borough
+  reports <- reports[!is.na(reports$BoroName),]
+
+#To facilitate plotting, we will also create some informative variables
+#mapvalues  allows us to relabel factor levels with different lengths
+  reports$Storm <- mapvalues(factor(reports$Date), from = levels(factor(reports$Date)), to = paste("Storm",sort(rep(1:8,2)),sep=""))
+  df <- as.data.frame(table(reports[,c("Storm","BoroCT2010")]))
+  colnames(df) <- c("Storm","BoroCT2010","Reports")
+
+#We use the table function to count each report by tract (BoroCT2010), Storm and report type
+  report_descrp <- function(des) as.data.frame(table(reports[reports$Descriptor==des,c("Storm","BoroCT2010")]))$Freq
+  temp <- matrix(unlist(lapply(levels(reports$Descriptor),report_descrp)),
+                 ncol=length(levels(reports$Descriptor)))
+  colnames(temp) <- c("Hanging.Limb","Limb.Down","Tree.Down","Tree.Poor","Tree.Uprooted","Split.Tree")
+  df <- cbind(df,data.frame(temp))
+
+#We plot the spatial distribution of all reports for a specific storm
+  btracts.df <- join(tracts.df,df,by="BoroCT2010")
+
+#We plot each damage type for a specific storm. Storm 8 is Sandy
+  btracts.df <- join(tracts.df,df[df$Storm=="Storm8",],by="BoroCT2010")
+  btracts.df$AllReports <- btracts.df$Reports
+#This requires us to "melt" the data.frame by damage type for faceting
+  colnames(btracts.df)
+  mtracts.df <- melt(btracts.df[,c(1:7,21:26)],id=colnames(btracts.df)[1:7])
+  mtracts.df$variable <-   
+    factor(mtracts.df$variable,labels=gsub("\\.","",levels(mtracts.df$variable)))
+
+####Planning Database: Loading + Transformation
+#create temp file, save zip file, unzip, extract main csv file
+#We read the "people"" census. Remove all non-NYC entries
+  temp <- tempfile()
+  url= "http://www.census.gov/research/data/planning_database/2014/docs/PDB_Tract_2014-11-20.zip"
+  download.file(url,temp)
+  people_census <- read.csv(unz(temp, "pdb2014trv9_us.csv"))
+  unlink(temp)
+
+#Remove all non-NYC entries
+  people_census <- people_census[people_census$State_name == "New York",]
+  people_census <- people_census[,-sort(unique(c(grep("ACSMOE",colnames(people_census)),
+                                                 grep("pct",colnames(people_census)),
+                                                 grep("CEN",colnames(people_census)))))]
+  people_census <- people_census[people_census$County_name == "New York County" |
+                                 people_census$County_name == "Queens County" | 
+                                 people_census$County_name == "Richmond County"|
+                                 people_census$County_name == "Kings County" |
+                                 people_census$County_name == "Bronx County",]
+  
+#We create a tract-specific BoroCT2010 variable so census can be merged with previous work
+  people_census$BCode <- as.numeric(as.character(factor(people_census$County_name,labels=c(2,3,1,4,5))))
+  temp <- paste("00000",as.character(people_census$Tract),sep="")
+  temp <- substr(temp,nchar(temp)-5,nchar(temp))
+  people_census$BoroCT2010 <- factor(paste(people_census$BCode,temp,sep=""))
+  
+#We remove unimportant variables (like measurement error and variables that are not counts)
+  people_census <- people_census[,c(11:127,131)]
+  people_census <- people_census[,-c(101,102,116,117)] #remove income variables since not counts
+  people_census <- people_census[,-c(45)] #remove Hmong since it has zero variance
+
+####Tree Census: Loading + Transformation
+#Read in Tree Census data (may take a few minutes)
+  tree_census <- read.csv("https://data.cityofnewyork.us/api/views/29bw-z7pj/rows.csv?accessType=DOWNLOAD")
+  tree_census = data.frame(table(tree_census$boro_ct))
+  colnames(tree_census) <- c("BoroCT2010","treecount")
+  
+#We merge the two census datasets together
+  census <- na.omit(join(people_census,tree_census,by="BoroCT2010"))
+  df <- join(census,df,by="BoroCT2010")
+```
+
+
+###Exploratory Plots
+Now we can start looking at specific demographic groups. We begin with a graphical inspection. We will create a function that bins requests per household by census variable quantile for each tract. This will let us see whether tracts with a large number of certain populations (single units households, for example, or non-English speakers) coincide with service request rate frequency. (To avoid ambiguities of assignment, quantile bins with the same value of census variables are merged.)
+
+```{r part2b,message=FALSE,warning=FALSE}
+#Create Variable Report per Household
+df$HHDReports <-  (df$Reports+1)/(df$Tot_Housing_Units_ACS_08_12+1)
+df$HHDReports[df$Tot_Housing_Units_ACS_08_12<100] <- NA
+
+#Create census_plot function to plot 311 reports by one census variable
+census_plot <- function(varb,storm="All Storms",name="none",n=5){
+  if(name=="none") name <- varb
+  ldf <-df[,c("BoroCT2010",varb,"HHDReports","Storm")]
+  colnames(ldf)[2] <- "varb"
+  sdf <- cbind(aggregate(HHDReports ~ BoroCT2010 + varb,ldf,sum),"All Storms")
+  colnames(sdf)[4] <- "Storm"
+  ldf <- rbind(ldf,sdf)
+  ldf$varb <- cut(ldf$varb,unique(quantile(ldf$varb,probs=seq(0,1,1/n))),include.lowest = TRUE,labels=FALSE)
+
+ggplot(ldf[ldf$Storm==storm,])+ 
+  theme_bw() +
+  aes(factor(varb),HHDReports)+
+  scale_y_log10() +
+  geom_boxplot() +
+  labs(x=paste(name,"\n in Tract (Quantile)"),
+       y="311 Requests / Household")
+}
+
+#Here are some example uses of the cenus_plot function
+#Any of the variables from 1:112 can be plotted (c.f. "colnames(df)[1:112]")
+  census_plot(varb="ENG_VW_ACS_08_12",name="Number of Households where\n No One Speaks English Very Well")
+  census_plot(varb="treecount",storm="Storm8",name="Number of Trees")
+  census_plot(varb="Owner_Occp_HU_ACS_08_12",name="Number of Owner Occupid Households")
+  census_plot(varb="Tot_Population_ACS_08_12",name="Total Population")
+  census_plot(varb="Tot_Vacant_Units_ACS_08_12",storm="Storm2",name="Total Population",n=10)
+  census_plot(varb="Sngl_Prns_HHD_ACS_08_12",storm="Storm8",name="Single Person Head of Household",n=10)
+```
+
+You can examine the relationship of any of the 112 American Community Survey variables this way. It looks like we've identified some important marginal relationships. For example, the number of reports decreases substantially with the number of households that do not speak english very well. Observe that the dependent variable is on the log base 10 scale so the change in median (the horizontal line in each box) is quite large. But don't run to the press quite yet. Unfortunately, all of the census variables we've looked at are highly correlated, and we can't tell whether high call rates are due to, for example, large population concentration or in tracts with many owner occupancies. We could change the census_plot function slightly to examine interactions. For example, we could facet by a second variable.
+
+```{r part2c,message=FALSE,warning=FALSE}
+#Create census_plot2 function to plot 311 reports by two census variables
+census_plot2 <- function(varb1,varb2,storm="All Storms",name="none",n1=5,n2=5){
+  if(name=="none") name <- paste(varb1,"\nby\n",varb2)
+  ldf <-df[,c("BoroCT2010",varb1,varb2,"HHDReports","Storm")]
+  colnames(ldf)[2] <- "varb1"
+  colnames(ldf)[3] <- "varb2"
+  sdf <- cbind(aggregate(HHDReports ~ BoroCT2010 + varb1 + varb2,ldf,sum),"All Storms")
+  colnames(sdf)[5] <- "Storm"
+  ldf <- rbind(ldf,sdf)
+  ldf$varb1 <- cut(ldf$varb1,unique(quantile(ldf$varb1,probs=seq(0,1,1/n1))),include.lowest = TRUE,labels=FALSE)
+  ldf$varb2 <- cut(ldf$varb2,unique(quantile(ldf$varb2,probs=seq(0,1,1/n2))),include.lowest = TRUE,labels=FALSE)
+
+ggplot(ldf[ldf$Storm==storm,])+ 
+  theme_bw() +
+  aes(factor(varb1),HHDReports)+
+  scale_y_log10() +
+  geom_boxplot() +
+  labs(x=paste(name,"\n in Tract (Quantile)"),
+       y="311 Requests / Household") +
+  facet_wrap(~varb2)
+}
+
+#Here are some example uses of the cenus_plot function
+#Any of the variables from 1:112 can be plotted (c.f. "colnames(df)[1:112]")
+census_plot2(varb1="Owner_Occp_HU_ACS_08_12",varb2="Tot_Population_ACS_08_12",
+             name="Num Owner Occupied HHD \nby\n Population",n2=6)
+
+census_plot2(varb1="ENG_VW_ACS_08_12",varb2="Renter_Occp_HU_ACS_08_12",
+             name="Num HHD Little English \nby\n Num Renter Occupied HHD",n2=6)
+```
+
+Now that we've plotted some two-way interactions, we'll have to revise some of our earlier assertions. It turns out that there is a correlation between population concentration and living near many owner occupied units. This partially reflects a conclusion from part 1,that residents on the suburban outerskirts of New York City are more likely to report damage. Also, remember our finding that number of households that do not speak english very well is related to the number of requests per household? That relationship is explained almost entirely by changes in the number of renter occupied households.   
+
+We could spend all week investigating and revising these complicated and highly correlated relationships. A more efficient aprpoach would be to construct a model. If the model is a reasonable approximation to the truth, it will help identify some of these relationships for us. There are as many ways to model data as there are statisticians. Our approach attempts to recreate the mechanism by which we think individuals actually use the 311 system. Of course, it relies on a "constancy" assumption. We break the request rate of each tract into components due to the amount of storm damage in that tract and to the propensity for residents to report that damage. We assume that storm damage is the same among tracts with similar tree counts and in spatial-temporal proximity to each other. We also assume that tracts with similar census characteristics will have similar propensities for reporting that damage. 
+
+###Modeling 311
+
+This constancy assumption is very strong, but it allows us to make ecological inferences. That is, it allows us to infer individual resident-level behavior from aggregate tract-level observations. In general, the assertion that group behavior must reflect individual member behavior is false. It is called the ecological fallacy. Our approach, assuming constant behvaior across socio-demographic groups, is known as the ecological regression model.
+
+For those of you with a slightly more advanced statistics background, we're going to fit a variation of the classic poisson regression model with an identity link. The variation aids model interpretability, and we'll provide a brief justification for the exact form of the model at the end of this post. We'll also put a normal prior with mean zero on the regression coefficient to add stability. This is a common strategy for handling the instability generated from highly correlated covariates, and it is known as a ridge regression. To estimate these parameters, we write this ecological model as a multilevel regression model in Stan. This requires us to install a new package, "rstan". 
+
+The model assumes that each resident requests damage removal with some base probability according to the amount of damage. That base probability is then magnified or reduced according to the census characteristics of the reporting resident. The amount of magnification or reduction is captured by the magnitude of the regression coefficient plotted below. One's multiplicative factor is simply the sum of the coefficients corresponding to their census characteristics. However, the coefficients are plotted in standard deviation units for comparability. 
+
+```{r part3a}
+#We load the library "rstan" and StanHeaders
+library("rstan")
+library("StanHeaders")
+
+#We add neighborhood info to df from tracts for spatial smoothing
+df <- join(df,unique(tracts.df[,c(12,14)]))
+
+#We construct matrix of select census covariates. Please change them as you see fit. 
+  people <- df[which(!duplicated(df$BoroCT2010)),1:112]
+  people <- people[,c(1,4,9,10:12,14,59,60,62,73,74,80:83,88,96,100:105)]
+
+#We scale census the covariates. Instead of centering we shrink to global mean.
+  people_means <- colMeans(people)
+  people_sds <- apply(people, 2, sd)
+  people <- scale(people,center=FALSE)
+  mean_ridge <- mean(colMeans(people))
+  J <- nrow(people)
+  K <- ncol(people)
+
+#We also pull the tree covariates and the neighborhood ids
+  tree <- df[which(!duplicated(df$BoroCT2010)),116:121]
+  L <- ncol(tree)
+  tract_id <- as.numeric(factor(df$BoroCT2010))
+  N <- nrow(df)
+  requests <- df$Reports
+  df$SNTA <- paste(df$Storm,df$NTACode,sep="_")
+  sneigh_id <- as.numeric(as.factor(df$SNTA))
+  M <- max(sneigh_id)
+
+#We construct our model.
+#requests happen with rate theta
+#theta is composed of a base rate and a damage rate
+#the damage rate is the product theta_storm and theta_people
+#theta_storm is the base probability of reporting storm damage. 
+#theta_people is the report probability adjustment of theta_storm due to demographic factors.
+
+model <-"
+data {
+  int<lower=1> J; //number of tracts
+  int<lower=1> M; //number of storm-neighborhoods
+  int<lower=1> N; // number of observations N=J*8
+  int<lower=1> K; //number of covaraites (race columns)
+  int<lower=1> L; //number of tree types (tree columns)
+  matrix[J,K] people; // groups of people in each tract j
+  matrix[J,L] tree; // trees for each tract j
+  int<lower=1,upper=J> tract_id[N]; // tract for observation n
+  int<lower=1,upper=M> sneigh_id[N]; //storm-neighborhood for observation n
+  int<lower=0,upper=150> requests[N]; // number of requests for observation n
+  real<lower=0> mean_ridge; //mean for ridge
+  }
+parameters {
+  real<lower=0> alpha_people;
+  vector[K] beta_people;
+  real<lower=0> sigma_people;
+  vector[L] beta_tree;
+  real mu[M];
+  real<lower=0> sigma_ridge;
+  }
+transformed parameters {
+  real<lower=0> theta[N];
+  vector[J] alpha_tree;
+  vector[J] theta_people;
+  real<lower=0> lambda_people[J];
+  real<lower=0,upper=1> theta_storm[N];
+  for(j in 1:J)
+      lambda_people[j] <- people[j,19] * alpha_people + 1e-100;
+  theta_people <- people * beta_people;
+  alpha_tree <- tree * beta_tree;
+  for(n in 1:N){
+    theta_storm[n] <- inv_logit(alpha_tree[tract_id[n]] + mu[sneigh_id[n]]);
+    theta[n] <- lambda_people[tract_id[n]] + 
+                theta_storm[n] * exp(theta_people[tract_id[n]]);
+  }
+}
+model {
+  requests ~ poisson(theta);
+  beta_people ~ normal(mean_ridge,sigma_ridge);
+}
+"
+
+#We find the MAP solution and plot the standardized census coefficients
+fit <- optimizing(stan_model(model_code=model),iter=1e6,seed=1)
+
+
+ggplot() +
+  geom_point(aes(factor(gsub("_ACS_08_12","",colnames(people)[order(fit$par[2:(K+1)])]),
+       levels=gsub("_ACS_08_12","",colnames(people)[order(fit$par[2:(K+1)])])),
+      sort(fit$par[2:(K+1)]))) + 
+  coord_flip() + 
+  geom_hline(yintercept = 0,linetype=2) +
+  theme_bw() + 
+  ylab("Report Probability Adjustment Factor") + 
+  xlab("Demographic Group") 
+```
+
+The interpretation of each coefficient is the unit change in the log-report probability adjustment factor due to a hypothetical standard deviation increase in the population of that demographic group, holding the membership of all other groups constant. Different demographic groups of residents in New York City can be compared by summing across the relevant coefficients and taking the log.
+
+According to this plot, tracts with many NH White, single units and large households have among the highest reporting rates. Tracts with many renters and large populations have the lowest. The coefficients suggest that. Of course, further study is required to validate any of these exploratory findings.
+
+```{r}
+#Plot the 311 Factor Spatially
+df$factor <- exp(fit$par[grep("theta_people",names(fit$par))])
+btracts.df <- join(tracts.df,
+        data.frame(BoroCT2010 = unique(df$BoroCT2010),
+        Tot_Housing_Units_ACS_08_12= df$Tot_Housing_Units_ACS_08_12[!duplicated(df$BoroCT2010)],
+        treecount = df$treecount[!duplicated(df$BoroCT2010)],
+        factor = fit$par[grep("theta_people",names(fit$par))]))
+
+#We set as NA tracts with fewer than 100 households or ten trees
+btracts.df$factor[btracts.df$Tot_Housing_Units_ACS_08_12<100] <- NA
+btracts.df$factor[btracts.df$treecount<10] <- NA
+
+ggplot(btracts.df)+
+  aes(x=long,y=lat,group=group,fill=log(factor+1,base=10))+
+  geom_polygon(color="grey",size=.1)+
+  scale_fill_continuous(low="white",high="black",na.value="grey")+
+  theme_nothing(legend=TRUE )+
+  theme(legend.position="bottom",
+        strip.background = element_rect(fill="white"))+
+  geom_polygon(aes(x=long,y=lat,group=group),data=parks.df,fill="dark green",
+               color="white",size=.1,alpha=.5) +
+  labs(fill=expression(log[10]("Demographic Factor"))) +
+  coord_equal()
+
+SNTA <- matrix(unlist(strsplit(df$SNTA,"_")),ncol=2,byrow=TRUE)
+SNTA <- data.frame(BoroCT2010 = df$BoroCT2010,
+                   Storm = SNTA[,1],
+                   Tot_Housing_Units_ACS_08_12 = df$Tot_Housing_Units_ACS_08_12,
+                   treecount = df$treecount,
+                   damage = fit$par[grep("theta_storm",names(fit$par))])
+btracts.df <- join(tracts.df,SNTA,by="BoroCT2010")
+
+#We set as NA tracts with fewer than 100 households or 10 trees
+btracts.df$damage[btracts.df$Tot_Housing_Units_ACS_08_12<100] <- NA
+btracts.df$damage[btracts.df$treecount<10] <- NA
+
+ggplot(btracts.df[!is.na(btracts.df$Storm),])+
+  aes(x=long,y=lat,group=group,fill=damage)+
+  geom_polygon(color="grey",size=.1)+
+  scale_fill_continuous(low="white",high="black",na.value="grey")+
+  theme_nothing(legend=TRUE )+
+  theme(legend.position="bottom",
+        strip.background = element_rect(fill="white"))+
+  geom_polygon(aes(x=long,y=lat,group=group),data=parks.df,fill="dark green",
+               color="white",size=.1,alpha=.5) +
+  labs(fill="Baseline Storm Damage") +
+  coord_equal() +
+  facet_wrap(~Storm,ncol=4)
+```
+
+We used Stan's optimizing function which searches for the posterior mode using L-BFGS. As we've already mention the model as we've defined it is multi-model. This means that running it with a different seed will yield a different result. The final step of our analysis is to perform stability selection to identify which of our inferences of demographic variables are stable. Basically, we will iteritively leave out a storm and rerun the model. Variables that are routinely selected will be deemed important.  
+
+```{r part3b, eval=FALSE}
+#We repeat the previous section in a loop, leaving out a storm each time.
+coef <- matrix(nrow=K,ncol=length(levels(df$Storm)))
+
+for(storm in levels(df$Storm)){
+  df_small <- df[df$Storm == storm,]
+  people <- df_small[which(!duplicated(df_small$BoroCT2010)),1:112]
+  people <- people[,c(1,4,9,10:12,14,59,60,62,73,74,80:83,88,96,100:105)]
+
+  people_means <- colMeans(people)
+  people_sds <- apply(people, 2, sd)
+  people <- scale(people,center=FALSE)
+  mean_ridge <- mean(colMeans(people))
+  J <- nrow(people)
+  K <- ncol(people)
+
+  tree <- df_small[which(!duplicated(df_small$BoroCT2010)),116:121]
+  L <- ncol(tree)
+  tract_id <- as.numeric(factor(df_small$BoroCT2010))
+  N <- nrow(df_small)
+  requests <- df_small$Reports
+  df_small$SNTA <- paste(df_small$Storm,df_small$NTACode,sep="_")
+  sneigh_id <- as.numeric(as.factor(df_small$SNTA))
+  M <- max(sneigh_id)
+
+  fit_small <- optimizing(stan_model(model_code=model),
+                          iter=1e6,seed=1,
+                          data = list())
+  coef[,which(storm == levels(df$Storm))] <-  fit_small$par[2:(K+1)] 
+}
+
+coef <- apply(coef,2,scale)
+runs <- data.frame(coef[order(fit$par[2:(K+1)]),],
+           name = factor(gsub("_ACS_08_12","",colnames(people)[order(fit$par[2:(K+1)])]),
+                  levels=gsub("_ACS_08_12","",colnames(people)[order(fit$par[2:(K+1)])]))
+           )
+colnames(runs)[1:8] <- paste("Storm",1:8)
+runs$fit <- scale(sort(fit$par[2:(K+1)]))
+runs <- melt(runs,id="name")
+runs$color = runs$variable=="fit"
+
+ggplot(runs) +
+  aes(name,value) +
+  geom_point(aes(color=color)) + 
+  coord_flip() + 
+  geom_hline(yintercept = 0,linetype=2) +
+  theme_bw() + 
+  theme(legend.position="none") +
+  ylab("Distribution of Report Probability Adjustment Factor") + 
+  xlab("Demographic Group") 
+```
+
+#Thoughts for municipal policymakers.
+
+We have shown that the public's reliance on 311 varies significantly across social groups, and we have taken steps to understand that variation. We looked at a few spatial and temporal plots, we built some boxplots, and we constructed a plausible model that described the way residents make 311 requests.
+
+Bottom line: The 311 systems that have popped up in cities across the country offer a valuable, tech-friendly avenue for the public to communicate real needs to public managers. But those systems will only be as valuable as public use allows them to be. And that value will fall short of its potential until all residents – all ages and backgrounds -- grow familiar enough with 311 to use it. Municipal leaders should consider reaching out to groups who, per their own analysis along these lines, seem hesitant when it comes to engaging with local government. Getting a sense -- as we tried to do here -- of who those residents are is an obvious start. Doing so is a matter both of social equality and of efficiency of resource allocation.
+
+###Model Explanation
+
+Consider any resident of New York City after a major storm like the ones in our dataset. She experienced some amount of damage, and she can either report or not report that damage. This "coinflip" decision is captured with the Bernoulli distribution. Let $x_ijk$ be her 1 if she calls and 0 otherwise. Then
+
+$$x_ijk \sim \text{ Bernoulli} (p_jk = \theta_k \cdot  \alpha_j)$$
+
+Subscripts $ijk$ refer to the fact that she is in the $ith$ member of the $jth$ demographic group experiencing the $kth$ level of damage. Variable $p_jk$ is the probability that someone from the $jth$ demographic group experiencing the $kth$ level of damage would report that damage. Variable $\theta_k$ is the baseline probability that any individual in the City would report $kth$ order damage and $\alpha_j$ is a nonnegative values discrimination parameter. The larger $\alpha_j$, the more likely the $jth$ demographic group will report damage.
+
+Assuming reports are independent and of equal probability within cell $jk$, we have that
+
+$$y_jk = \sum_i x_ijk \sim \text{ Binomial} (N_j,p_jk) \approx \text{ Poisson} (p_jk \cdot N_j)$$
+
+Variable $N_j$ is the observed number of individuals within demographic group $j$. Thus, we have a poisson regression model with identify link and independent variables $N_j$ and coefficients $p_jk$. We can estimate $\theta_k$ by looking at variation of report rates across similarly damaged tracts. These are tracts in close space-time proximity with the same number of trees. Similarly, we can etimate $\alpha_j$ by looking at report rates across tracts with similar numbers of demographic group $j$. This suggests the equations:
+
+$$\theta_k = Z_1 \beta_1 + \tau_{sn}, \alpha_k = Z_2 \beta_2 + \epsilon_{t}$$
+
+where $Z_1$ is a matrix of treecounts by tract, $Z_2$ is a matrix of demographic count variable by tract, $\tau_{sn}$ is a neighborhood-storm level random effect and $\epsilon_t$ is a tract-level random effect. A mean zero normal distribution is given to $\beta_2$ for stability.
+
+
